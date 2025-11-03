@@ -8,15 +8,15 @@
 #define PORT 8080
 
 
-void remove_newline(char *str) {
+void remove_newline(char *str) { //supprime les \n à la fin des chaines pour ne pas envoyer des lignes avec des doubles sauts 
 	size_t len = strlen(str);
 	if (len > 0 && str[len - 1] == '\n')
 		str[len - 1] = '\0';
 }
 
 
-int connect_to_server(void) {
-	int sock;
+int connect_to_server(void) { //crée un socket TCP et se connecte au serveur 
+	int sock; 
 	struct sockaddr_in serv_addr;
 
 	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -42,8 +42,8 @@ int connect_to_server(void) {
 }
 
 
-int login_user(int sock, char *username) {
-	char buffer[1024] = {0};
+int login_user(int sock, char *username) { // demande un login à l'utilisateur
+	char buffer[1024] = {0};                 
 	char message[128];
 
 	printf("Entre ton pseudo (20 caractères max, lettres, chiffres, - ou _) : ");
@@ -53,12 +53,12 @@ int login_user(int sock, char *username) {
 	}
 
 	remove_newline(username);
-	snprintf(message, sizeof(message), "LOGIN %s\n", username);
+	snprintf(message, sizeof(message), "LOGIN %s\n", username); //construit un messsage : "LOGIN pseudo"
 
-	send(sock, message, strlen(message), 0);
+	send(sock, message, strlen(message), 0); //envoie le message au serveur 
 	printf("Connexion en cours avec le pseudo : %s\n", username);
 
-	int valread = read(sock, buffer, sizeof(buffer) - 1);
+	int valread = read(sock, buffer, sizeof(buffer) - 1); //reçoit la réponse du serveur 
 	if (valread > 0) {
 		buffer[valread] = '\0';
 		printf("Réponse du serveur : %s\n", buffer);
@@ -73,7 +73,7 @@ void command_loop(int sock) {
 	char command[128];
 	int valread;
 
-	 printf("\nVous êtes maintenant connecté(e) !\n");
+	printf("\nVous êtes maintenant connecté(e) !\n"); //tableau de bord pour l'utilisateur
     printf("Commandes disponibles :\n");
     printf("   - LIST                      : voir les utilisateurs connectés\n");
     printf("   - CHALLENGE <pseudo>        : défier un joueur\n");
@@ -82,13 +82,13 @@ void command_loop(int sock) {
     printf("   - QUIT                      : quitter\n\n");	
 
 	while (1) {
-        fd_set readfds;
+        fd_set readfds; //file descriptors à surveiller pour lecture.
         int maxfd;
 
         FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
-        FD_SET(STDIN_FILENO, &readfds);
-        if (sock > STDIN_FILENO){
+        FD_SET(sock, &readfds); //on ajoute le socket du serveur à surveiller
+        FD_SET(STDIN_FILENO, &readfds); //On veut aussi savoir quand l’utilisateur tape quelque chose.
+        if (sock > STDIN_FILENO){ //maxfd = max(sock, STDIN_FILENO).
     		maxfd = sock;
 		}
 		else{
