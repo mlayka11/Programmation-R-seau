@@ -17,7 +17,7 @@ static int player = 1;      // 1 ou 2
 static bool gameOver = false;
 
 static const char *FONT_PATH_CANDIDATES[] = {
-  "/System/Library/Fonts/Supplemental/Arial.ttf",  // ✅ chemin trouvé sur ton Mac
+  "/System/Library/Fonts/Supplemental/Arial.ttf",  //  chemin à changer
   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
   "/Library/Fonts/Arial.ttf",
   "DejaVuSans.ttf",
