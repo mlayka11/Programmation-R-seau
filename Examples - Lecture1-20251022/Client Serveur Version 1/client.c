@@ -80,6 +80,9 @@ static void command_loop(int sock) {
     printf("   - ACCEPT <pseudo>            : accepter un défi\n");
     printf("   - REFUSE <pseudo>            : refuser un défi\n");
     printf("   - MOVE <1..6>                : jouer un coup (pendant une partie)\n");
+    printf("   - GAMES                      : afficher la liste des parties en cours\n");
+    printf("   - OBSERVE <id|pseudo>        : observer une partie donnée\n");
+    printf("   - UNOBSERVE                  : quitter le mode observation\n");
     printf("   - QUIT                       : quitter\n\n");
 
     while (1) {
