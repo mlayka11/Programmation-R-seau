@@ -1,6 +1,8 @@
 // awale.c : implémentation minimale des règles (sans aff/SDL)
 #include "awale.h"
 #include <string.h>
+// games.c
+
 
 // règle simple : score >= 25 => fin
 static int game_over(int p1, int p2) {
