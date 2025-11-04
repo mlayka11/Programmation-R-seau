@@ -6,8 +6,74 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "users.h"
+#include "awale.h"
+#include <time.h>
+
 
 #define PORT 8080
+#define MAX_GAMES 128
+
+typedef struct {
+    int active;
+    char a[64], b[64];   // pseudos
+    int sock_a, sock_b;  // sockets
+    int board[12];
+    int p1, p2;          // scores
+    int player;          // 1 (J1=a) ou 2 (J2=b)
+} Game;
+
+static Game games[MAX_GAMES];
+static pthread_mutex_t games_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void games_init(void) {
+    for (int i = 0; i < MAX_GAMES; i++) games[i].active = 0;
+}
+
+static int game_find_by_user(const char *user) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (games[i].active &&
+            (strcmp(games[i].a, user) == 0 || strcmp(games[i].b, user) == 0))
+            return i;
+    }
+    return -1;
+}
+
+static int game_new(const char *a, int sock_a, const char *b, int sock_b) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (!games[i].active) {
+            games[i].active = 1;
+            strncpy(games[i].a, a, sizeof(games[i].a)-1);
+            strncpy(games[i].b, b, sizeof(games[i].b)-1);
+            games[i].a[sizeof(games[i].a)-1] = '\0';
+            games[i].b[sizeof(games[i].b)-1] = '\0';
+            games[i].sock_a = sock_a;
+            games[i].sock_b = sock_b;
+            aw_init(games[i].board, &games[i].p1, &games[i].p2, &games[i].player);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void game_end(int idx) {
+    games[idx].active = 0;
+}
+
+static void game_send_state(int idx) {
+    char buf[512];
+    // envoie le plateau et les scores aux deux joueurs
+    int *B = games[idx].board;
+    snprintf(buf, sizeof(buf),
+        "BOARD %d %d %d %d %d %d\n"
+        "      %d %d %d %d %d %d | SCORE %d %d | TURN %s\n",
+        B[11], B[10], B[9], B[8], B[7], B[6],
+        B[0],  B[1],  B[2], B[3], B[4], B[5],
+        games[idx].p1, games[idx].p2,
+        (games[idx].player==1)?games[idx].a:games[idx].b
+    );
+    send(games[idx].sock_a, buf, strlen(buf), 0);
+    send(games[idx].sock_b, buf, strlen(buf), 0);
+}
 
 // --- Fonction thread : gère un client ---
 static void* client_handler(void* arg) { // arg transporte le socket vers le thread
@@ -94,24 +160,52 @@ static void* client_handler(void* arg) { // arg transporte le socket vers le thr
 
         // --- Acceptation de défi ---
         else if (strcmp(cmd, "ACCEPT") == 0) {
-            char opponent[64] = {0};
-            if (sscanf(buffer, "%*s %63s", opponent) != 1) {
-                send(new_socket, "ERREUR : pseudo adversaire manquant\n", 36, 0);
-            } else if (current_user[0] == '\0') {
-                send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+    char opponent[64] = {0};
+    if (sscanf(buffer, "%*s %63s", opponent) != 1) {
+        send(new_socket, "ERREUR : pseudo adversaire manquant\n", 36, 0);
+    } else if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+    } else {
+        int osock = get_user_socket(opponent);
+        if (osock < 0) {
+            send(new_socket, "ERREUR : adversaire indisponible\n", 33, 0);
+        } else {
+            // Notifier acceptation (comme tu le faisais)
+            char ok[160];
+            snprintf(ok, sizeof(ok), "CHALLENGE_ACCEPTED %s %s\n", opponent, current_user);
+            send(new_socket, ok, strlen(ok), 0);
+            send(osock,   ok, strlen(ok), 0);
+
+            // === CRÉER LA PARTIE ===
+            int idx = game_new(opponent, osock, current_user, new_socket);
+            if (idx < 0) {
+                send(new_socket, "ERREUR : trop de parties\n", 26, 0);
             } else {
-                int osock = get_user_socket(opponent);
-                if (osock < 0) {
-                    send(new_socket, "ERREUR : adversaire indisponible\n", 33, 0);
-                } else {
-                    char ok[160];
-                    snprintf(ok, sizeof(ok), "CHALLENGE_ACCEPTED %s %s\n", opponent, current_user);
-                    send(new_socket, ok, strlen(ok), 0);
-                    send(osock,   ok, strlen(ok), 0);
-                    // TODO : créer la partie, choisir qui commence, etc.
+                // Tirage aléatoire : 50% on inverse J1/J2 pour choisir qui commence
+                if (rand() % 2) {
+                    Game g = games[idx];
+                    int sa = g.sock_a; g.sock_a = g.sock_b; g.sock_b = sa;
+                    char tmpn[64]; strncpy(tmpn, g.a, 63); tmpn[63]='\0';
+                    strncpy(g.a, g.b, 63); g.a[63]='\0';
+                    strncpy(g.b, tmpn, 63); g.b[63]='\0';
+                    games[idx] = g;
+                    aw_init(games[idx].board, &games[idx].p1, &games[idx].p2, &games[idx].player);
                 }
+
+                char start[160];
+                snprintf(start, sizeof(start), "GAME_START %s %s | STARTS %s\n",
+                         games[idx].a, games[idx].b,
+                         (games[idx].player==1)?games[idx].a:games[idx].b);
+                send(games[idx].sock_a, start, strlen(start), 0);
+                send(games[idx].sock_b, start, strlen(start), 0);
+
+                // Envoie l’état initial
+                game_send_state(idx);
             }
         }
+    }
+}
+
 
         // --- Refus de défi ---
         else if (strcmp(cmd, "REFUSE") == 0) {
@@ -137,10 +231,76 @@ static void* client_handler(void* arg) { // arg transporte le socket vers le thr
             set_socket_disconnected(new_socket);
             break;
         }
+	else if (strcmp(cmd, "MOVE") == 0) {
+    int k = 0;
+    if (sscanf(buffer, "%*s %d", &k) != 1) {
+        send(new_socket, "ERREUR : MOVE <1..6>\n", 22, 0);
+        continue;
+    }
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    int gi = game_find_by_user(current_user);
+    if (gi < 0 || !games[gi].active) {
+        send(new_socket, "ERREUR : aucune partie en cours\n", 32, 0);
+        continue;
+    }
+
+    int isA = (strcmp(games[gi].a, current_user) == 0);
+    int my_player = isA ? 1 : 2;
+
+    if (games[gi].player != my_player) {
+        send(new_socket, "ERREUR : pas ton tour\n", 23, 0);
+        continue;
+    }
+
+    /* --- Mapping identique à ton jeu ncurses --- */
+    int pit_index = -1;
+    if (k >= 1 && k <= 6) {
+        if (my_player == 1) {
+            pit_index = k - 1;      /* J1 : 1..6 -> 0..5 */
+        } else {
+            pit_index = 5 + k;      /* J2 : 1..6 -> 6..11 (pit += 6 en 1-based) */
+        }
+    }
+
+    if (pit_index < 0) {
+        send(new_socket, "ERREUR : MOVE invalide (1..6)\n", 30, 0);
+        continue;
+    }
+
+    /* Vérification et application (mêmes règles que ton game()) */
+    if (!aw_is_legal(games[gi].board, games[gi].player, pit_index)) {
+        send(new_socket, "ERREUR : coup illégal\n", 22, 0);
+        continue;
+    }
+
+    int ended = aw_play(games[gi].board, &games[gi].p1, &games[gi].p2,
+                        &games[gi].player, pit_index);
+
+    game_send_state(gi);
+
+    if (ended) {
+        char over[160];
+        const char *winner = (games[gi].p1 > games[gi].p2) ? games[gi].a :
+                             (games[gi].p2 > games[gi].p1) ? games[gi].b : "DRAW";
+        snprintf(over, sizeof(over), "GAME_OVER WINNER %s | SCORE %d %d\n",
+                 winner, games[gi].p1, games[gi].p2);
+        send(games[gi].sock_a, over, strlen(over), 0);
+        send(games[gi].sock_b, over, strlen(over), 0);
+        game_end(gi);
+    }
+}
+
+
+
 
         else {
             send(new_socket, "ERREUR : commande inconnue\n", 29, 0);
         }
+		
     }
 
     close(new_socket);
@@ -180,6 +340,8 @@ int main(int argc, char const* argv[])
     }
 
     // Mise en écoute
+	srand((unsigned)time(NULL));
+	games_init();
     if (listen(server_fd, 3) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
