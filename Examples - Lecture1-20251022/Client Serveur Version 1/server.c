@@ -12,18 +12,24 @@
 
 #define PORT 8080
 #define MAX_GAMES 128
+#define MAX_SPECT 16
 
 typedef struct {
     int active;
-    char a[64], b[64];   // pseudos
-    int sock_a, sock_b;  // sockets
+    int id;                     // nouvel id unique
+    char a[64], b[64];
+    int sock_a, sock_b;
     int board[12];
-    int p1, p2;          // scores
-    int player;          // 1 (J1=a) ou 2 (J2=b)
+    int p1, p2;
+    int player;
+    int spectators[MAX_SPECT];  // sockets observateurs
+    int nspec;
 } Game;
 
 static Game games[MAX_GAMES];
 static pthread_mutex_t games_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int next_game_id = 1;
+
 
 static void games_init(void) {
     for (int i = 0; i < MAX_GAMES; i++) games[i].active = 0;
@@ -42,6 +48,9 @@ static int game_new(const char *a, int sock_a, const char *b, int sock_b) {
     for (int i = 0; i < MAX_GAMES; i++) {
         if (!games[i].active) {
             games[i].active = 1;
+			games[i].id = next_game_id++;
+			games[i].nspec = 0;
+			for (int k=0;k<MAX_SPECT;k++) games[i].spectators[k] = -1;
             strncpy(games[i].a, a, sizeof(games[i].a)-1);
             strncpy(games[i].b, b, sizeof(games[i].b)-1);
             games[i].a[sizeof(games[i].a)-1] = '\0';
@@ -61,19 +70,55 @@ static void game_end(int idx) {
 
 static void game_send_state(int idx) {
     char buf[512];
-    // envoie le plateau et les scores aux deux joueurs
     int *B = games[idx].board;
     snprintf(buf, sizeof(buf),
+        "GAME %d\n"
         "BOARD %d %d %d %d %d %d\n"
         "      %d %d %d %d %d %d | SCORE %d %d | TURN %s\n",
-        B[11], B[10], B[9], B[8], B[7], B[6],
-        B[0],  B[1],  B[2], B[3], B[4], B[5],
+        games[idx].id,
+        B[11],B[10],B[9],B[8],B[7],B[6],
+        B[0], B[1], B[2], B[3], B[4], B[5],
         games[idx].p1, games[idx].p2,
         (games[idx].player==1)?games[idx].a:games[idx].b
     );
+
+    // joueurs
     send(games[idx].sock_a, buf, strlen(buf), 0);
     send(games[idx].sock_b, buf, strlen(buf), 0);
+
+    // observateurs
+    for (int s=0; s<games[idx].nspec; s++) {
+        int os = games[idx].spectators[s];
+        if (os >= 0) send(os, buf, strlen(buf), 0);
+    }
 }
+
+static int game_find_by_id(int gid) {
+    for (int i=0;i<MAX_GAMES;i++)
+        if (games[i].active && games[i].id == gid) return i;
+    return -1;
+}
+
+static void game_add_spectator(int idx, int sock) {
+    if (games[idx].nspec < MAX_SPECT) {
+        games[idx].spectators[games[idx].nspec++] = sock;
+        // lui envoyer l’état immédiatement
+        game_send_state(idx);
+    } else {
+        const char *msg = "ERREUR : trop de spectateurs\n";
+        send(sock, msg, strlen(msg), 0);
+    }
+}
+
+static void game_remove_spectator(int idx, int sock) {
+    for (int i=0;i<games[idx].nspec;i++) {
+        if (games[idx].spectators[i] == sock) {
+            games[idx].spectators[i] = games[idx].spectators[--games[idx].nspec];
+            return;
+        }
+    }
+}
+
 
 // --- Fonction thread : gère un client ---
 static void* client_handler(void* arg) { // arg transporte le socket vers le thread
@@ -232,21 +277,22 @@ static void* client_handler(void* arg) { // arg transporte le socket vers le thr
             break;
         }
 	else if (strcmp(cmd, "MOVE") == 0) {
-    int k = 0;
-    if (sscanf(buffer, "%*s %d", &k) != 1) {
-        send(new_socket, "ERREUR : MOVE <1..6>\n", 22, 0);
-        continue;
-    }
-    if (current_user[0] == '\0') {
-        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
-        continue;
-    }
+		int k = 0;
+		if (sscanf(buffer, "%*s %d", &k) != 1) {
+			send(new_socket, "ERREUR : MOVE <1..6>\n", 22, 0);
+			continue;
+		}
+		if (current_user[0] == '\0') {
+			send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+			continue;
+		}
 
-    int gi = game_find_by_user(current_user);
-    if (gi < 0 || !games[gi].active) {
-        send(new_socket, "ERREUR : aucune partie en cours\n", 32, 0);
-        continue;
+		int gi = game_find_by_user(current_user);
+		if (gi < 0 || !games[gi].active) {
+			send(new_socket, "ERREUR : aucune partie en cours\n", 32, 0);
+			continue;
     }
+	
 
     int isA = (strcmp(games[gi].a, current_user) == 0);
     int my_player = isA ? 1 : 2;
@@ -283,18 +329,83 @@ static void* client_handler(void* arg) { // arg transporte le socket vers le thr
     game_send_state(gi);
 
     if (ended) {
-        char over[160];
-        const char *winner = (games[gi].p1 > games[gi].p2) ? games[gi].a :
-                             (games[gi].p2 > games[gi].p1) ? games[gi].b : "DRAW";
-        snprintf(over, sizeof(over), "GAME_OVER WINNER %s | SCORE %d %d\n",
-                 winner, games[gi].p1, games[gi].p2);
-        send(games[gi].sock_a, over, strlen(over), 0);
-        send(games[gi].sock_b, over, strlen(over), 0);
-        game_end(gi);
+    char over[160];
+    const char *winner = (games[gi].p1 > games[gi].p2) ? games[gi].a :
+                         (games[gi].p2 > games[gi].p1) ? games[gi].b : "DRAW";
+    snprintf(over, sizeof(over), "GAME_OVER WINNER %s | SCORE %d %d\n",
+             winner, games[gi].p1, games[gi].p2);
+    send(games[gi].sock_a, over, strlen(over), 0);
+    send(games[gi].sock_b, over, strlen(over), 0);
+    for (int s=0;s<games[gi].nspec;s++) {
+        int os = games[gi].spectators[s];
+        if (os >= 0) send(os, over, strlen(over), 0);
     }
+    game_end(gi);
+}
+
 }
 
 
+		else if (strcmp(cmd, "GAMES") == 0) {
+    pthread_mutex_lock(&games_mutex);
+    char out[1024]; out[0] = '\0';
+    strcat(out, "PARTIES:\n");
+    for (int i=0;i<MAX_GAMES;i++) {
+        if (games[i].active) {
+            char line[128];
+           snprintf(line, sizeof(line), "  - id=%d : %.20s vs %.20s  (score %d:%d)\n",
+         games[i].id, games[i].a, games[i].b, games[i].p1, games[i].p2);
+            if (strlen(out) + strlen(line) + 1 < sizeof(out)) strcat(out, line);
+        }
+    }
+    if (strcmp(out, "PARTIES:\n") == 0) strcat(out, "  (aucune)\n");
+    pthread_mutex_unlock(&games_mutex);
+    send(new_socket, out, strlen(out), 0);
+}
+
+else if (strcmp(cmd, "OBSERVE") == 0) {
+    char arg[64]; arg[0]='\0';
+    if (sscanf(buffer, "%*s %63s", arg) != 1) {
+        send(new_socket, "ERREUR : OBSERVE <id|pseudo>\n", 30, 0);
+        continue;
+    }
+
+    pthread_mutex_lock(&games_mutex);
+    int gi = -1;
+
+    // essayer par id
+    int gid = atoi(arg);
+    if (gid > 0) gi = game_find_by_id(gid);
+
+    // sinon par pseudo
+    if (gi < 0) {
+        for (int i=0;i<MAX_GAMES;i++) {
+            if (games[i].active &&
+               (strcmp(games[i].a, arg)==0 || strcmp(games[i].b, arg)==0)) {
+                gi = i; break;
+            }
+        }
+    }
+
+    if (gi < 0) {
+        pthread_mutex_unlock(&games_mutex);
+        send(new_socket, "ERREUR : partie introuvable\n", 28, 0);
+        continue;
+    }
+
+    game_add_spectator(gi, new_socket);
+    pthread_mutex_unlock(&games_mutex);
+    send(new_socket, "OK OBSERVE\n", 11, 0);
+}
+	else if (strcmp(cmd, "UNOBSERVE") == 0) {
+    pthread_mutex_lock(&games_mutex);
+    for (int i=0;i<MAX_GAMES;i++) {
+        if (!games[i].active) continue;
+        game_remove_spectator(i, new_socket);
+    }
+    pthread_mutex_unlock(&games_mutex);
+    send(new_socket, "OK UNOBSERVE\n", 13, 0);
+}
 
 
         else {
@@ -302,6 +413,15 @@ static void* client_handler(void* arg) { // arg transporte le socket vers le thr
         }
 		
     }
+
+	 set_socket_disconnected(new_socket);  // (si tu as une fonction pour marquer le socket)
+    pthread_mutex_lock(&games_mutex);
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (!games[i].active) continue;
+        game_remove_spectator(i, new_socket);
+        // si c’était un joueur, tu peux aussi ici gérer la fin de partie forcée
+    }
+    pthread_mutex_unlock(&games_mutex);
 
     close(new_socket);
     printf("Connexion terminée.\n");
