@@ -2,20 +2,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <unistd.h>
+#include <sys/select.h>
 
 #define PORT 8080
 
 /* Supprime le '\n' final si présent */
-static void remove_newline(char *str) {
+void remove_newline(char *str) {
     size_t len = strlen(str);
     if (len > 0 && str[len - 1] == '\n')
         str[len - 1] = '\0';
 }
 
 /* Connexion TCP au serveur */
-static int connect_to_server(void) {
+int connect_to_server(void) {
     int sock;
     struct sockaddr_in serv_addr;
 
@@ -41,8 +41,8 @@ static int connect_to_server(void) {
     return sock;
 }
 
-/* Phase de login utilisateur */
-static int login_user(int sock, char *username) {
+/* Login utilisateur */
+int login_user(int sock, char *username) {
     char buffer[1024] = {0};
     char message[128];
 
@@ -61,17 +61,16 @@ static int login_user(int sock, char *username) {
     int valread = read(sock, buffer, sizeof(buffer) - 1);
     if (valread > 0) {
         buffer[valread] = '\0';
-        printf("Réponse du serveur : %s", buffer);
-        /* Le serveur renvoie "Connexion réussie !" si OK */
+        printf("Réponse du serveur : %s\n", buffer);
         return strstr(buffer, "Connexion réussie") != NULL;
     }
     return 0;
 }
 
-/* Boucle principale : écoute clavier + socket serveur avec select() */
-static void command_loop(int sock) {
+/* Boucle principale de commandes */
+void command_loop(int sock) {
     char buffer[1024];
-    char command[256];
+    char command[128];
 
     printf("\nVous êtes maintenant connecté(e) !\n");
     printf("Commandes disponibles :\n");
@@ -80,7 +79,12 @@ static void command_loop(int sock) {
     printf("   - ACCEPT <pseudo>            : accepter un défi\n");
     printf("   - REFUSE <pseudo>            : refuser un défi\n");
     printf("   - MOVE <1..6>                : jouer un coup (pendant une partie)\n");
+    printf("   - GAMES                      : voir les parties en cours\n");
+    printf("   - OBSERVE <id|pseudo>        : observer une partie\n");
+    printf("   - UNOBSERVE                  : arrêter d'observer\n");
     printf("   - QUIT                       : quitter\n\n");
+    printf("   - MSG <pseudo> msg           : message privé\n\n");
+    printf("    - BROADCAST msg              : message public\n\n");
 
     while (1) {
         fd_set readfds;
@@ -89,20 +93,17 @@ static void command_loop(int sock) {
         FD_ZERO(&readfds);
         FD_SET(sock, &readfds);
         FD_SET(STDIN_FILENO, &readfds);
-
-        if (sock > STDIN_FILENO) maxfd = sock;
-        else                     maxfd = STDIN_FILENO;
+        maxfd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
 
         printf("> ");
         fflush(stdout);
 
-        /* Attente d'un événement (entrée clavier ou message serveur) */
         if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
             perror("select");
             break;
         }
 
-        /* Message reçu du serveur (notifications, état du jeu, etc.) */
+        /* Message reçu du serveur */
         if (FD_ISSET(sock, &readfds)) {
             int n = read(sock, buffer, sizeof(buffer) - 1);
             if (n <= 0) {
@@ -110,12 +111,10 @@ static void command_loop(int sock) {
                 break;
             }
             buffer[n] = '\0';
-
-            /* Affiche tel quel (le serveur inclut déjà les '\n') */
             printf("\n[Serveur] %s", buffer);
         }
 
-        /* Saisie utilisateur (commande) */
+        /* Commande saisie par l'utilisateur */
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             if (fgets(command, sizeof(command), stdin) == NULL)
                 break;
@@ -129,21 +128,16 @@ static void command_loop(int sock) {
                 break;
             }
 
-            if (command[0] == '\0') {
-                /* ligne vide → on ignore */
+            if (command[0] == '\0')
                 continue;
-            }
 
-            /* Ajoute un '\n' pour le protocole serveur (lecture ligne) */
-            {
-                char out[300];
-                int n = snprintf(out, sizeof(out), "%s\n", command);
-                if (n > 0) send(sock, out, (size_t)n, 0);
-            }
+            strcat(command, "\n");
+            send(sock, command, strlen(command), 0);
         }
     }
 }
 
+/* Programme principal */
 int main(void) {
     int sock;
     char username[64];

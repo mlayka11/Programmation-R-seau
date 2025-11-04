@@ -2,6 +2,9 @@
 #define USERS_H
 
 #include <stddef.h>
+#include <pthread.h>
+
+extern pthread_mutex_t users_mutex;
 
 typedef enum {
     U_OFFLINE = 0,
@@ -37,6 +40,8 @@ int  user_is_available(const char *name);
 int  user_set_pending_pair(const char *a, const char *b);   /* atomique, 0 = OK */
 void user_set_in_game_pair(const char *a, const char *b);
 void user_clear_pair(const char *a, const char *b);
+const char* get_username_by_index(int i);
+
 
 /* trim util si besoin côté serveur */
 static inline void trim_inplace(char *s) {
