@@ -1,0 +1,215 @@
+
+typedef struct {
+    int active;
+    int id;                 /* identifiant de partie (stable) */
+    char a[64], b[64];      /* pseudos J1/J2 */
+    int sock_a, sock_b;     /* sockets J1/J2 */
+    int board[12];
+    int p1, p2;             /* scores */
+    int player;             /* 1=J1(a) ou 2=J2(b) */
+    int specs[MAX_SPECTATORS];
+    int spec_count;
+} Game;
+
+static Game games[MAX_GAMES];
+static pthread_mutex_t games_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int next_game_id = 1;  /* IDs uniques de parties */
+
+
+static void games_init(void) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        games[i].active = 0;
+        games[i].id = 0;
+        games[i].spec_count = 0;
+    }
+}
+
+
+static int game_find_by_user(const char *user) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (games[i].active &&
+            (strcmp(games[i].a, user) == 0 || strcmp(games[i].b, user) == 0))
+            return i;
+    }
+    return -1;
+}
+
+
+
+
+static int game_new(const char *a, int sock_a, const char *b, int sock_b) {
+    pthread_mutex_lock(&games_mutex);
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (!games[i].active) {
+            games[i].active = 1;
+            games[i].id = next_game_id++;
+            strncpy(games[i].a, a, sizeof(games[i].a)-1);
+            strncpy(games[i].b, b, sizeof(games[i].b)-1);
+            games[i].a[sizeof(games[i].a)-1] = '\0';
+            games[i].b[sizeof(games[i].b)-1] = '\0';
+            games[i].sock_a = sock_a;
+            games[i].sock_b = sock_b;
+            games[i].spec_count = 0;
+            for (int k=0;k<MAX_SPECTATORS;k++) games[i].specs[k] = -1;
+            aw_init(games[i].board, &games[i].p1, &games[i].p2, &games[i].player);
+            pthread_mutex_unlock(&games_mutex);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&games_mutex);
+    return -1;
+}
+
+
+static void game_end(int idx) {
+    pthread_mutex_lock(&games_mutex);
+    games[idx].active = 0;
+    games[idx].id = 0;
+    games[idx].spec_count = 0;
+    pthread_mutex_unlock(&games_mutex);
+}
+/*
+static void save_game_to_csv(Game *g) {
+    FILE *f = fopen("games_history.csv", "a");
+    if (!f) return;
+
+    // Récupère la date actuelle
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char datebuf[64];
+    strftime(datebuf, sizeof(datebuf), "%Y-%m-%d %H:%M:%S", t);
+
+    // Détermine le gagnant
+    const char *winner = (g->p1 > g->p2) ? g->a :
+                         (g->p2 > g->p1) ? g->b : "DRAW";
+
+    // Écrit une ligne CSV
+    fprintf(f, "%d,%s,%s,%d,%d,%s,%s\n",
+            g->id, g->a, g->b, g->p1, g->p2, winner, datebuf);
+
+    fclose(f);
+}*/
+
+int game_find_by_socket(int sock) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (!games[i].active) continue;
+        if (games[i].sock_a == sock || games[i].sock_b == sock)
+            return i;
+    }
+    return -1;
+}
+void game_abort_by_socket(int sock) {
+    int gi = game_find_by_socket(sock);
+    if (gi < 0) return;
+
+    // Notifie les deux (si encore ouverts)
+    if (games[gi].sock_a >= 0) send(games[gi].sock_a, "GAME_ABORT\n", 11, 0);
+    if (games[gi].sock_b >= 0) send(games[gi].sock_b, "GAME_ABORT\n", 11, 0);
+
+    game_end(gi); // ta fonction qui libère/retire la partie et met active=0
+}
+
+
+static void game_send_state(int idx) {
+    char buf[512];
+    int *B = games[idx].board;
+    snprintf(buf, sizeof(buf),
+        "BOARD %d %d %d %d %d %d\n"
+        "      %d %d %d %d %d %d | SCORE %d %d | TURN %s\n",
+        B[11], B[10], B[9], B[8], B[7], B[6],
+        B[0],  B[1],  B[2], B[3], B[4], B[5],
+        games[idx].p1, games[idx].p2,
+        (games[idx].player==1)?games[idx].a:games[idx].b
+    );
+
+    /* joueurs */
+    send(games[idx].sock_a, buf, strlen(buf), 0);
+    send(games[idx].sock_b, buf, strlen(buf), 0);
+
+    /* observateurs */
+    for (int i=0;i<games[idx].spec_count;i++) {
+        int s = games[idx].specs[i];
+        if (s >= 0) send(s, buf, strlen(buf), 0);
+    }
+}
+
+
+
+
+
+
+static int game_find_by_id(int id) {
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (games[i].active && games[i].id == id) return i;
+    }
+    return -1;
+}
+
+static void game_add_spectator(int idx, int sock) {
+    pthread_mutex_lock(&games_mutex);
+    if (games[idx].spec_count < MAX_SPECTATORS) {
+        /* déjà présent ? */
+        for (int i=0;i<games[idx].spec_count;i++) {
+            if (games[idx].specs[i] == sock) { pthread_mutex_unlock(&games_mutex); return; }
+        }
+        games[idx].specs[games[idx].spec_count++] = sock;
+    }
+    pthread_mutex_unlock(&games_mutex);
+}
+
+static void game_remove_spectator(int idx, int sock) {
+    for (int i = 0; i < games[idx].spec_count; i++) {
+        if (games[idx].specs[i] == sock) {
+            games[idx].specs[i] = games[idx].specs[games[idx].spec_count - 1];
+            games[idx].spec_count--;
+            break;
+        }
+    }
+}
+
+static void remove_unallowed_spectators(const char *username) {
+    pthread_mutex_lock(&games_mutex);
+    for (int i = 0; i < MAX_GAMES; i++) {
+        if (!games[i].active) continue;
+
+        // Si le joueur est impliqué dans cette partie
+        if (strcmp(games[i].a, username) == 0 || strcmp(games[i].b, username) == 0) {
+            for (int s = 0; s < games[i].spec_count; ) {
+                int sock = games[i].specs[s];
+                const char *spectator = get_username_by_socket(sock);
+
+                // Si pas d'identité, ou pas ami autorisé => on le vire
+                if (!spectator || !is_friend_allowed(username, spectator)) {
+                    send(sock, "INFO : cette partie est devenue privée, vous ne pouvez plus observer.\n", 75, 0);
+                    game_remove_spectator(i, sock);
+                    continue; // ne pas incrémenter s car la liste se compresse
+                }
+                s++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&games_mutex);
+}
+
+static void save_game_to_csv(const char *playerA, const char *playerB,
+                             int scoreA, int scoreB, const char *winner)
+{
+    FILE *f = fopen("data/games_history.csv", "a");
+    if (!f) {
+        perror("fopen");
+        return;
+    }
+
+    // Obtenir la date/heure locale
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char date[32];
+    strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    // Écrire une ligne CSV
+    fprintf(f, "%s,%s,%d,%s,%d,%s,%s\n",
+            date, playerA, scoreA, playerB, scoreB, winner,
+            (scoreA == scoreB) ? "DRAW" : "WIN");
+
+    fclose(f);
+}

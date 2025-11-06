@@ -1,0 +1,447 @@
+/*     LOGIN        */
+        if (strcmp(cmd, "LOGIN") == 0) {
+            trim_inplace(username);
+            if (sscanf(buffer, "%*s %1023s", username) == 1) {
+                
+                if (!is_valid_username(username)) {
+                    send(new_socket, "ERREUR : pseudo invalide\n", 26, 0);
+                } else if (username_exists(username)) {
+                    send(new_socket, "ERREUR : pseudo déjà utilisé\n", 31, 0);
+                } else {
+                    if (!add_user(username)) {
+                        send(new_socket, "ERREUR : serveur plein\n", 24, 0);
+                    } else {
+                        set_user_socket(username, new_socket);
+                        user_set_state(username, U_AVAILABLE);     
+                        users_set_opponent(username, "");   
+                        strncpy(current_user, username, sizeof(current_user) - 1);
+                        send(new_socket, "Connexion réussie !\n", 22, 0);
+                        printf("Nouvel utilisateur : %s (total = %d)\n",
+                               username, get_user_count());
+                    }
+                }
+            } else {
+                send(new_socket, "ERREUR : pseudo manquant\n", 26, 0);
+            }
+        }
+        /*     LIST        */
+        else if (strcmp(cmd, "LIST") == 0) {
+            char listbuf[1024];
+            get_user_list(listbuf, sizeof(listbuf));
+            send(new_socket, listbuf, strlen(listbuf), 0);
+        }
+        /*     CHALLENGE       */
+        else if (strcmp(cmd, "CHALLENGE") == 0) {
+            char target[64] = {0};
+            if (sscanf(buffer, "%*s %63s", target) != 1) {
+                send(new_socket, "ERREUR : pseudo cible manquant\n", 31, 0);
+            } else {
+                trim_inplace(target);
+                trim_inplace(current_user);
+
+                if (current_user[0] == '\0') {
+                    send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+                } else if (strcmp(current_user, target) == 0) {
+                    send(new_socket, "ERREUR : tu ne peux pas te défier toi-même\n", 45, 0);
+                } else if (!username_exists(target)) {
+                    send(new_socket, "ERREUR : joueur introuvable\n", 29, 0);
+                } else {
+                    int tsock = get_user_socket(target);
+                    if (tsock < 0 || fcntl(tsock, F_GETFD) == -1) {
+                        send(new_socket, "ERREUR : joueur non disponible\n", 31, 0);
+                    }
+                    // Vérifie que chacun est disponible (pas pending / in_game)
+                    else if (!user_is_available(current_user)) {
+                        send(new_socket, "ERREUR : tu es occupé\n", 22, 0);
+                    } else if (!user_is_available(target)) {
+                        send(new_socket, "ERREUR : joueur occupé\n", 23, 0);
+                    } else {
+                        // Marquer les deux en attente (PENDING) de façon atomique
+                        if (user_set_pending_pair(current_user, target) < 0) {
+                            send(new_socket, "ERREUR : état changé, réessaie\n", 31, 0);
+                        } else {
+                            char notif[128];
+                            snprintf(notif, sizeof(notif), "CHALLENGE_FROM %s\n", current_user);
+                            send(tsock, notif, strlen(notif), 0);
+                            send(new_socket, "CHALLENGE_SENT\n", 15, 0);
+                        }
+                    }
+                }
+            }
+}
+
+
+        /*     ACCEPT       */
+        else if (strcmp(cmd, "ACCEPT") == 0) {
+    char opponent[64] = {0};
+    if (sscanf(buffer, "%*s %63s", opponent) != 1) {
+        send(new_socket, "ERREUR : pseudo adversaire manquant\n", 36, 0);
+    } 
+    else if (strcmp(current_user, opponent) == 0) {
+        send(new_socket, "ERREUR : tu ne peux pas te défier toi-même\n", 45, 0);}
+    else if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+    } else {
+        int osock = get_user_socket(opponent);
+        if (osock < 0) {
+            send(new_socket, "ERREUR : adversaire indisponible\n", 33, 0);
+        } else {
+            // Notifier acceptation (comme tu le faisais)
+            char ok[160];
+            snprintf(ok, sizeof(ok), "CHALLENGE_ACCEPTED %s %s\n", opponent, current_user);
+            send(new_socket, ok, strlen(ok), 0);
+            send(osock,   ok, strlen(ok), 0);
+
+            // === CRÉER LA PARTIE ===
+            int idx = game_new(opponent, osock, current_user, new_socket);
+            if (idx < 0) {
+                send(new_socket, "ERREUR : trop de parties\n", 26, 0);
+            } else {
+                // Tirage aléatoire : 50% on inverse J1/J2 pour choisir qui commence
+                user_set_in_game_pair(opponent, current_user); // met U_IN_GAME pour les deux + opponent=...
+                if (rand() % 2) {
+                    Game g = games[idx];
+                    int sa = g.sock_a; g.sock_a = g.sock_b; g.sock_b = sa;
+                    char tmpn[64]; strncpy(tmpn, g.a, 63); tmpn[63]='\0';
+                    strncpy(g.a, g.b, 63); g.a[63]='\0';
+                    strncpy(g.b, tmpn, 63); g.b[63]='\0';
+                    games[idx] = g;
+                    aw_init(games[idx].board, &games[idx].p1, &games[idx].p2, &games[idx].player);
+                }
+
+                char start[160];
+                snprintf(start, sizeof(start), "GAME_START %s %s | STARTS %s\n",
+                         games[idx].a, games[idx].b,
+                         (games[idx].player==1)?games[idx].a:games[idx].b);
+                send(games[idx].sock_a, start, strlen(start), 0);
+                send(games[idx].sock_b, start, strlen(start), 0);
+                game_send_state(idx);
+            }
+        }
+    }
+}
+
+
+          /*     REFUSE       */
+    else if (strcmp(cmd, "REFUSE") == 0) {
+        char opponent[64] = {0};
+        if (sscanf(buffer, "%*s %63s", opponent) != 1) {
+            send(new_socket, "ERREUR : pseudo adversaire manquant\n", 36, 0);
+        } else if (current_user[0] == '\0') {
+            send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        } else {
+            trim_inplace(opponent);
+            // On annule un défi en attente : remettre les deux à AVAILABLE
+            user_clear_pair(current_user, opponent); // remet U_AVAILABLE + opponent=""
+
+            int osock = get_user_socket(opponent);
+            if (osock >= 0) {
+                char r[160];
+                snprintf(r, sizeof(r), "CHALLENGE_REFUSED %s %s\n", opponent, current_user);
+                send(osock, r, strlen(r), 0);
+            }
+            send(new_socket, "REFUSE_OK\n", 10, 0);
+        }
+    }
+
+       else if (strcmp(cmd, "QUIT") == 0) {
+            send(new_socket, "Déconnexion réussie.\n", 22, 0);
+            printf(">> %s s'est déconnecté proprement.\n", current_user[0] ? current_user : "Client inconnu");
+
+            set_socket_disconnected(new_socket);
+
+            shutdown(new_socket, SHUT_RDWR);
+            close(new_socket);
+            pthread_exit(NULL); // arrête juste le thread client, pas le serveur
+        }
+
+
+
+        /*     MOVE      */
+	    else if (strcmp(cmd, "MOVE") == 0) {
+            int k = 0;
+            if (sscanf(buffer, "%*s %d", &k) != 1) {
+                send(new_socket, "ERREUR : MOVE <1..6>\n", 22, 0);
+                continue;
+            }
+            if (current_user[0] == '\0') {
+                send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+                continue;
+            }
+
+            int gi = game_find_by_user(current_user);
+            if (gi < 0 || !games[gi].active) {
+                send(new_socket, "ERREUR : aucune partie en cours\n", 32, 0);
+                continue;
+            }
+
+            int isA = (strcmp(games[gi].a, current_user) == 0);
+            int my_player = isA ? 1 : 2;
+
+            if (games[gi].player != my_player) {
+                send(new_socket, "ERREUR : pas ton tour\n", 23, 0);
+                continue;
+            }
+
+            /* --- Mapping identique à ton jeu ncurses --- */
+            int pit_index = -1;
+            if (k >= 1 && k <= 6) {
+                if (my_player == 1) {
+                    pit_index = k - 1;      /* J1 : 1..6 -> 0..5 */
+                } else {
+                    pit_index = 5 + k;      /* J2 : 1..6 -> 6..11 (pit += 6 en 1-based) */
+                }
+            }
+            if (pit_index < 0) {
+                send(new_socket, "ERREUR : MOVE invalide (1..6)\n", 30, 0);
+                continue;
+            }
+            /* Vérification et application (mêmes règles que ton game()) */
+            if (!aw_is_legal(games[gi].board, games[gi].player, pit_index)) {
+                send(new_socket, "ERREUR : coup illégal\n", 22, 0);
+                continue;
+            }
+            int ended = aw_play(games[gi].board, &games[gi].p1, &games[gi].p2,
+                                &games[gi].player, pit_index);
+
+            game_send_state(gi);
+
+            if (ended) {
+                char over[160];
+                const char *winner = (games[gi].p1 > games[gi].p2) ? games[gi].a :
+                                    (games[gi].p2 > games[gi].p1) ? games[gi].b : "DRAW";
+                snprintf(over, sizeof(over), "GAME_OVER WINNER %s | SCORE %d %d\n",
+                        winner, games[gi].p1, games[gi].p2);
+                send(games[gi].sock_a, over, strlen(over), 0);
+                send(games[gi].sock_b, over, strlen(over), 0);
+                save_game_to_csv(games[gi].a, games[gi].b, games[gi].p1, games[gi].p2, winner);
+                user_clear_pair(games[gi].a, games[gi].b);
+                game_end(gi);
+}
+
+}
+        else if (strcmp(cmd, "GAMES") == 0) {
+            char out[2048]; out[0]='\0';
+            strncat(out, "PARTIES:\n", sizeof(out)-1);
+            pthread_mutex_lock(&games_mutex);
+            for (int i=0;i<MAX_GAMES;i++) {
+                if (!games[i].active) continue;
+                char line[256];
+                snprintf(line, sizeof(line), "  - id=%d : %s vs %s  (score %d:%d)\n",
+                        games[i].id, games[i].a, games[i].b, games[i].p1, games[i].p2);
+                strncat(out, line, sizeof(out)-strlen(out)-1);
+            }
+            pthread_mutex_unlock(&games_mutex);
+            send(new_socket, out, strlen(out), 0);
+            }
+            else if (strcmp(cmd, "OBSERVE") == 0) {
+            char arg[64] = {0};
+            if (sscanf(buffer, "%*s %63s", arg) != 1) {
+                send(new_socket, "ERREUR : usage OBSERVE <id|pseudo>\n", 35, 0);
+                continue;
+            }
+
+            int gi = -1;
+
+            /* si c'est un nombre -> id */
+            char *endp = NULL;
+            long id = strtol(arg, &endp, 10);
+            if (endp && *endp == '\0') {
+                gi = game_find_by_id((int)id);
+            } else {
+                gi = game_find_by_user(arg);
+            }
+
+            if (gi < 0 || !games[gi].active) {
+                send(new_socket, "ERREUR : partie introuvable\n", 28, 0);
+                continue;
+            }
+
+            /* empêcher un joueur d’observer sa propre partie (optionnel) */
+            if (new_socket == games[gi].sock_a || new_socket == games[gi].sock_b) {
+                send(new_socket, "INFO : tu es déjà joueur de cette partie\n", 41, 0);
+                continue;
+            }
+            /* Vérifie si le mode privé est activé pour l’un des deux joueurs */
+            int privateA = is_user_private(games[gi].a);
+            int privateB = is_user_private(games[gi].b);
+
+            if ((privateA && !is_friend_allowed(games[gi].a, current_user)) ||
+                (privateB && !is_friend_allowed(games[gi].b, current_user))) {
+                send(new_socket, "INFO : cette partie est privée, tu n'es pas autorisé(e) à observer.\n", 71, 0);
+                continue;
+            }
+
+
+            game_add_spectator(gi, new_socket);
+            send(new_socket, "OBSERVE_OK\n", 11, 0);
+            game_send_state(gi); /* on envoie l’état actuel au nouvel observateur */
+        }
+
+else if (strcmp(cmd, "UNOBSERVE") == 0) {
+    int removed = 0;
+    pthread_mutex_lock(&games_mutex);
+    for (int i=0;i<MAX_GAMES;i++) {
+        if (!games[i].active) continue;
+        /* on tente la suppression (la fonction gère si absent) */
+        int before = games[i].spec_count;
+        game_remove_spectator(i, new_socket);
+        if (games[i].spec_count != before) removed = 1;
+    }
+    pthread_mutex_unlock(&games_mutex);
+    if (removed) send(new_socket, "UNOBSERVE_OK\n", 13, 0);
+    else         send(new_socket, "INFO : tu n'observais aucune partie\n", 36, 0);
+}
+
+else if (strcmp(cmd, "MSG") == 0) {
+    char target[64] = {0}, msgtext[900] = {0};
+    if (sscanf(buffer, "%*s %63s %[^\n]", target, msgtext) < 2) {
+        send(new_socket, "ERREUR : usage MSG <pseudo> <message>\n", 38, 0);
+        continue;
+    }
+
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    int tsock = get_user_socket(target);
+    if (tsock < 0) {
+        send(new_socket, "ERREUR : joueur introuvable\n", 29, 0);
+        continue;
+    }
+
+    char formatted[1024];
+    snprintf(formatted, sizeof(formatted), "[Privé de %s] %s\n", current_user, msgtext);
+    send(tsock, formatted, strlen(formatted), 0);
+    send(new_socket, "MSG_OK\n", 7, 0);
+}
+else if (strcmp(cmd, "BROADCAST") == 0) {
+    char msgtext[900] = {0};
+    if (sscanf(buffer, "%*s %[^\n]", msgtext) != 1) {
+        send(new_socket, "ERREUR : usage BROADCAST <message>\n", 35, 0);
+        continue;
+    }
+
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    int nb_sent = 0;
+    int total = get_user_count();  /* cette fonction gère son propre mutex */
+
+    for (int i = 0; i < total; i++) {
+        const char* uname = get_username_by_index(i);  /* mutex interne */
+        if (!uname) continue;
+
+        int s = get_user_socket(uname);  /* mutex interne */
+        if (s >= 0 && s != new_socket) {
+            char formatted[1024];
+            snprintf(formatted, sizeof(formatted), "[%s à tous] %s\n", current_user, msgtext);
+            send(s, formatted, strlen(formatted), 0);
+            nb_sent++;
+        }
+    }
+
+    if (nb_sent == 0)
+        send(new_socket, "INFO : aucun destinataire connecté.\n", 36, 0);
+    else
+        send(new_socket, "BROADCAST_OK\n", 13, 0);
+}
+
+else if (strcmp(cmd, "SETBIO") == 0) {
+    char bio[1024] = {0};
+    if (sscanf(buffer, "%*s %[^\n]", bio) != 1) {
+        send(new_socket, "ERREUR : usage SETBIO <texte>\n", 31, 0);
+        continue;
+    }
+
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    set_user_bio(current_user, bio);
+    send(new_socket, "BIO_OK\n", 7, 0);
+}
+
+else if (strcmp(cmd, "SHOWBIO") == 0) {
+    char target[64] = {0};
+    if (sscanf(buffer, "%*s %63s", target) != 1) {
+        send(new_socket, "ERREUR : usage SHOWBIO <pseudo>\n", 32, 0);
+        continue;
+    }
+
+    const char *bio = get_user_bio(target);
+    if (!bio || bio[0] == '\0') {
+        send(new_socket, "Aucune bio trouvée pour cet utilisateur.\n", 40, 0);
+    } else {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "--- Bio de %s ---\n%s\n-------------------\n", target, bio);
+        send(new_socket, msg, strlen(msg), 0);
+    }
+}
+
+else if (strcmp(cmd, "ADDFRIEND") == 0) {
+    char friendname[64] = {0};
+    if (sscanf(buffer, "%*s %63s", friendname) != 1) {
+        send(new_socket, "ERREUR : usage ADDFRIEND <pseudo>\n", 34, 0);
+        continue;
+    }
+
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    if (!username_exists(friendname)) {
+        send(new_socket, "ERREUR : joueur inconnu\n", 25, 0);
+        continue;
+    }
+
+    add_user_friend(current_user, friendname);
+    send(new_socket, "FRIEND_ADDED\n", 13, 0);
+}
+
+
+
+else if (strcmp(cmd, "PRIVATEON") == 0) {
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+
+    set_user_private(current_user, 1);
+    send(new_socket, "Mode privé activé : seuls tes amis peuvent observer tes parties.\n", 66, 0);
+
+    // 🔹 On retire immédiatement les spectateurs non autorisés
+    remove_unallowed_spectators(current_user);
+}
+
+
+else if (strcmp(cmd, "PRIVATEOFF") == 0) {
+    if (current_user[0] == '\0') {
+        send(new_socket, "ERREUR : connecte-toi d'abord (LOGIN)\n", 38, 0);
+        continue;
+    }
+    set_user_private(current_user, 0);
+    send(new_socket, "Mode privé désactivé : tout le monde peut observer tes parties.\n", 66, 0);
+}
+
+else if (strcmp(cmd, "HISTORY") == 0) {
+    FILE *f = fopen("games_history.csv", "r");
+    if (!f) {
+        send(new_socket, "Aucune partie enregistrée.\n", 28, 0);
+        continue;
+    }
+
+    char line[256];
+    send(new_socket, "=== HISTORIQUE DES PARTIES ===\n", 32, 0);
+    while (fgets(line, sizeof(line), f)) {
+        send(new_socket, line, strlen(line), 0);
+    }
+    fclose(f);
+    send(new_socket, "===============================\n", 33, 0);
+}
+
