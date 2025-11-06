@@ -41,6 +41,15 @@ int  user_set_pending_pair(const char *a, const char *b);   /* atomique, 0 = OK 
 void user_set_in_game_pair(const char *a, const char *b);
 void user_clear_pair(const char *a, const char *b);
 const char* get_username_by_index(int i);
+void set_user_bio(const char *username, const char *bio);
+const char* get_user_bio(const char *username);
+void add_user_friend(const char *username, const char *friendname);
+int is_friend_allowed(const char *username, const char *friendname);
+void set_user_private(const char *username, int mode);
+int is_user_private(const char *username);
+
+
+
 
 
 /* trim util si besoin côté serveur */

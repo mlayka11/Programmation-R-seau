@@ -5,9 +5,28 @@
 
 
 // règle simple : score >= 25 => fin
-static int game_over(int p1, int p2) {
-    return (p1 >= 25 || p2 >= 25);
+static int game_over(const int board[12], int p1, int p2) {
+    // condition 1 : score >= 25
+    if (p1 >= 25 || p2 >= 25)
+        return 1;
+
+    // condition 2 : il ne reste que deux cases contenant exactement 1 graine
+    int count_ones = 0;
+    int non_empty = 0;
+    for (int i = 0; i < 12; i++) {
+        if (board[i] > 0) {
+            non_empty++;
+            if (board[i] == 1) count_ones++;
+        }
+    }
+
+    // Fin de partie si toutes les cases sont vides sauf deux avec 1 graine chacune
+    if (non_empty == 2 && count_ones == 2)
+        return 1;
+
+    return 0;
 }
+
 
 void aw_init(int board[12], int *p1, int *p2, int *player) {
     for (int i = 0; i < 12; i++) board[i] = 4;
@@ -25,11 +44,7 @@ int aw_is_legal(const int board[12], int player, int pit) {
     }
 }
 
-// logique de capture minimaliste (comme ta version C) :
-// - sème n graines à partir de pit+1 (sans sauter la case adverse, version simple)
-// - si la case finale vaut 2 ou 3 : capturer, puis remonter tant que c’est 2 ou 3
-// NOTE : cette version n’implémente pas les subtilités “famine” du standard oware.
-// Suffisant pour le TP tant que tu valides la légalité côté serveur.
+
 int aw_play(int board[12], int *p1, int *p2, int *player, int pit) {
     int n = board[pit];
     board[pit] = 0;
@@ -64,5 +79,5 @@ int aw_play(int board[12], int *p1, int *p2, int *player, int pit) {
     // change de joueur
     *player = (*player == 1) ? 2 : 1;
 
-    return game_over(*p1, *p2);
+    return game_over(board,*p1, *p2);
 }

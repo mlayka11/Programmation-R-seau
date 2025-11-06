@@ -6,6 +6,13 @@
 #include <unistd.h>
 #include "users.h"
 
+
+#define MAX_FRIENDS 16
+static char user_friends[100][MAX_FRIENDS][64]; // 100 users max
+static int user_friend_count[100];
+static int user_private_mode[100];  // 0 = public, 1 = privé
+
+
 /* Mutex global pour protéger la liste d'utilisateurs */
 pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -36,20 +43,53 @@ static int index_by_socket(int sock) {
 }
 
 /* --- Initialisation et nettoyage --- */
+/* ---- Ajout : stockage des bios ---- */
+static char (*user_bio)[1024] = NULL;
+
+/* Mets à jour init_users() */
 void init_users(int initial_capacity) {
     user_capacity = (initial_capacity > 0) ? initial_capacity : 10;
-    users = calloc(user_capacity, sizeof(char*));
-    user_sockets = calloc(user_capacity, sizeof(int));
-    user_states = calloc(user_capacity, sizeof(user_state_t));
-    user_opponent = calloc(user_capacity, sizeof(*user_opponent));
+
+    users         = (char**)calloc(user_capacity, sizeof(char*));
+    user_sockets  = (int*)calloc(user_capacity, sizeof(int));
+    user_states   = (user_state_t*)calloc(user_capacity, sizeof(user_state_t));
+    user_opponent = (char (*)[64])calloc(user_capacity, sizeof(*user_opponent));
+    user_bio      = (char (*)[1024])calloc(user_capacity, sizeof(*user_bio));
 
     for (int i = 0; i < user_capacity; i++) {
         user_sockets[i] = -1;
-        user_states[i] = U_OFFLINE;
+        user_states[i]  = U_OFFLINE;
         user_opponent[i][0] = '\0';
+        user_bio[i][0] = '\0';
+        user_private_mode[i] = 0;
     }
     user_count = 0;
 }
+
+void set_user_bio(const char *username, const char *bio) {
+    pthread_mutex_lock(&users_mutex);
+    int i = -1;
+    for (int j = 0; j < user_count; j++) {
+        if (users[j] && strcmp(users[j], username) == 0) { i = j; break; }
+    }
+    if (i >= 0) {
+        strncpy(user_bio[i], bio, sizeof(user_bio[i]) - 1);
+        user_bio[i][sizeof(user_bio[i]) - 1] = '\0';
+    }
+    pthread_mutex_unlock(&users_mutex);
+}
+
+const char* get_user_bio(const char *username) {
+    pthread_mutex_lock(&users_mutex);
+    int i = -1;
+    for (int j = 0; j < user_count; j++) {
+        if (users[j] && strcmp(users[j], username) == 0) { i = j; break; }
+    }
+    const char *res = (i >= 0) ? user_bio[i] : NULL;
+    pthread_mutex_unlock(&users_mutex);
+    return res;
+}
+
 
 static void ensure_capacity(void) {
     if (user_count < user_capacity) return;
@@ -102,8 +142,17 @@ int is_valid_username(const char *u) {
 }
 
 int username_exists(const char *u) {
-    return index_by_name(u) >= 0;
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && strcmp(users[i], u) == 0) {
+            if (user_states[i] == U_AVAILABLE || user_states[i] == U_PENDING || user_states[i] == U_IN_GAME)
+                return 1;
+            else
+                return 0; 
+        }
+    }
+    return 0;
 }
+
 
 int get_user_count(void) {
     return user_count;
@@ -111,15 +160,28 @@ int get_user_count(void) {
 
 void get_user_list(char *buffer, int bufsize) {
     if (bufsize <= 0) return;
+
     buffer[0] = '\0';
-    strncat(buffer, "UTILISATEURS :", bufsize - 1);
+    strncat(buffer, "UTILISATEURS :", (size_t)bufsize - 1);
+
     for (int i = 0; i < user_count; i++) {
         if (!users[i]) continue;
-        strncat(buffer, " ", bufsize - strlen(buffer) - 1);
-        strncat(buffer, users[i], bufsize - strlen(buffer) - 1);
+        if (user_sockets[i] < 0) continue;
+        size_t used = strlen(buffer);
+        if (used + 1 >= (size_t)bufsize) break;
+        strncat(buffer, " ", (size_t)bufsize - used - 1);
+
+        used = strlen(buffer);
+        if (used >= (size_t)bufsize - 1) break;
+        strncat(buffer, users[i], (size_t)bufsize - used - 1);
     }
-    strncat(buffer, "\n", bufsize - strlen(buffer) - 1);
+
+    size_t used = strlen(buffer);
+    if (used < (size_t)bufsize - 1) {
+        strncat(buffer, "\n", (size_t)bufsize - used - 1);
+    }
 }
+
 
 /* --- Gestion des utilisateurs --- */
 int add_user(const char *u) {
@@ -245,30 +307,89 @@ void user_clear_pair(const char *a, const char *b) {
 
 /* --- Déconnexion propre --- */
 void set_socket_disconnected(int sock) {
-    char self[64] = {0}, opp[64] = {0};
-    int opp_sock = -1;
-    user_state_t prev = U_OFFLINE;
+    const char* me = get_username_by_socket(sock);
 
-    pthread_mutex_lock(&users_mutex);
-    int i = index_by_socket(sock);
-    if (i < 0) {
-        pthread_mutex_unlock(&users_mutex);
-        return;
+    if (me && me[0]) {
+        printf(">> Déconnexion de %s\n", me);
+
+        // Marquer l’utilisateur comme disponible à nouveau
+        set_user_socket(me, -1);
+        user_set_state(me, U_AVAILABLE);  // ← avant : U_OFFLINE
+        users_set_opponent(me, "");
+
+    } else {
+        // Aucun pseudo connu, on nettoie juste le socket
+        for (int i = 0; i < user_count; i++) {
+            if (user_sockets[i] == sock) {
+                user_sockets[i] = -1;
+                break;
+            }
+        }
     }
 
-    if (users[i]) strncpy(self, users[i], 63);
-    if (user_opponent[i][0]) {
-        strncpy(opp, user_opponent[i], 63);
-        int j = index_by_name(opp);
-        if (j >= 0) opp_sock = user_sockets[j];
-    }
-
-    prev = user_states[i];
-    user_sockets[i] = -1;
-    user_states[i] = U_OFFLINE;
-    user_opponent[i][0] = '\0';
-    pthread_mutex_unlock(&users_mutex);
-
-    if (prev == U_IN_GAME && opp_sock >= 0)
-        game_abort_by_socket(sock);
+    // Nettoyer toute partie associée
+    game_abort_by_socket(sock);
 }
+
+void add_user_friend(const char *username, const char *friendname) {
+    pthread_mutex_lock(&users_mutex);
+    int i = -1;
+    for (int j = 0; j < user_count; j++) {
+        if (users[j] && strcmp(users[j], username) == 0) { i = j; break; }
+    }
+    if (i >= 0 && user_friend_count[i] < MAX_FRIENDS) {
+        // Éviter les doublons
+        for (int k = 0; k < user_friend_count[i]; k++) {
+            if (strcmp(user_friends[i][k], friendname) == 0) {
+                pthread_mutex_unlock(&users_mutex);
+                return;
+            }
+        }
+        strncpy(user_friends[i][user_friend_count[i]++], friendname, 63);
+    }
+    pthread_mutex_unlock(&users_mutex);
+}
+
+int is_friend_allowed(const char *username, const char *friendname) {
+    pthread_mutex_lock(&users_mutex);
+    int i = -1;
+    for (int j = 0; j < user_count; j++) {
+        if (users[j] && strcmp(users[j], username) == 0) { i = j; break; }
+    }
+    int ok = 0;
+    if (i >= 0) {
+        for (int k = 0; k < user_friend_count[i]; k++) {
+            if (strcmp(user_friends[i][k], friendname) == 0) {
+                ok = 1;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&users_mutex);
+    return ok;
+}
+
+void set_user_private(const char *username, int mode) {
+    pthread_mutex_lock(&users_mutex);
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && strcmp(users[i], username) == 0) {
+            user_private_mode[i] = (mode != 0);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&users_mutex);
+}
+
+int is_user_private(const char *username) {
+    pthread_mutex_lock(&users_mutex);
+    int res = 0;
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && strcmp(users[i], username) == 0) {
+            res = user_private_mode[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&users_mutex);
+    return res;
+}
+
